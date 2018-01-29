@@ -13,6 +13,13 @@ const { EntityNotFoundError } = require("./errors");
 const MemoryAdapter = require("./memory-adapter");
 
 /**
+ * @typedef tenantStrategy
+ * @property {function} [getAdapterHash] return hash for caching adapter
+ * @property {function} [getAdapter] return adapter which can tenant specific db adapter
+ * @property {array} [tenantKeys] tenant keys for adding to every query in case of same db for multiple tenants
+ */
+
+/**
  * Service mixin to access database entities
  *
  * @name moleculer-db
@@ -24,6 +31,9 @@ module.exports = {
 
 	// Store adapter (NeDB adapter is the default)
 	adapter: null,
+
+	/** @type {tenantStrategy} */
+	tenantStrategy: null,
 
 	/**
 	 * Default settings
@@ -89,8 +99,10 @@ module.exports = {
 			handler(ctx) {
 				let params = this.sanitizeParams(ctx, ctx.params);
 
-				return this.adapter.find(params)
-					.then(docs => this.transformDocuments(ctx, params, docs));
+				return this.getAdapter(ctx).then((adapter) => {
+					return adapter.find(params)
+						.then(docs => this.transformDocuments(ctx, params, docs));
+				});
 
 			}
 		},
@@ -125,7 +137,7 @@ module.exports = {
 				if (params && params.offset)
 					params.offset = null;
 
-				return this.adapter.count(params);
+				return this.getAdapter(ctx).then((adapter) => adapter.count(params));
 			}
 		},
 
@@ -170,28 +182,30 @@ module.exports = {
 				if (countParams && countParams.offset)
 					countParams.offset = null;
 
+				return this.getAdapter(ctx).then((adapter) => {
+					return Promise.all([
+						// Get rows
+						adapter.find(params),
 
-				return Promise.all([
-					// Get rows
-					this.adapter.find(params),
-
-					// Get count of all rows
-					this.adapter.count(countParams)
-				]).then(res => {
-					return this.transformDocuments(ctx, params, res[0])
-						.then(docs => {
-							return {
-								// Rows
-								rows: docs,
-								// Total rows
-								total: res[1],
-								// Page
-								page: params.page,
-								// Page size
-								pageSize: params.pageSize,
-								// Total pages
-								totalPages: Math.floor((res[1] + params.pageSize - 1) / params.pageSize)
-							};
+						// Get count of all rows
+						adapter.count(countParams)
+					])
+						.then(res => {
+							return this.transformDocuments(ctx, params, res[0])
+								.then(docs => {
+									return {
+										// Rows
+										rows: docs,
+										// Total rows
+										total: res[1],
+										// Page
+										page: params.page,
+										// Page size
+										pageSize: params.pageSize,
+										// Total pages
+										totalPages: Math.floor((res[1] + params.pageSize - 1) / params.pageSize)
+									};
+								});
 						});
 				});
 			}
@@ -208,10 +222,12 @@ module.exports = {
 			handler(ctx) {
 				let entity = ctx.params;
 
-				return this.validateEntity(entity)
-					.then(entity => this.adapter.insert(entity))
-					.then(doc => this.transformDocuments(ctx, {}, doc))
-					.then(json => this.entityChanged("created", json, ctx).then(() => json));
+				return this.getAdapter(ctx).then((adapter) => {
+					return this.validateEntity(entity)
+						.then(entity => adapter.insert(entity))
+						.then(doc => this.transformDocuments(ctx, {}, doc))
+						.then(json => this.entityChanged("created", json, ctx).then(() => json));
+				});
 
 			}
 		},
@@ -234,19 +250,21 @@ module.exports = {
 			handler(ctx) {
 				let params = this.sanitizeParams(ctx, ctx.params);
 
-				return Promise.resolve()
-					.then(() => {
-						if (Array.isArray(params.entities)) {
-							return this.validateEntity(params.entities)
-								.then(entities => this.adapter.insertMany(entities));
-						} else if (params.entity) {
-							return this.validateEntity(params.entity)
-								.then(entity => this.adapter.insert(entity));
-						}
-						return Promise.reject(new MoleculerClientError("Invalid request! The 'params' must contain 'entity' or 'entities'!", 400));
-					})
-					.then(docs => this.transformDocuments(ctx, params, docs))
-					.then(json => this.entityChanged("created", json, ctx).then(() => json));
+				return this.getAdapter(ctx).then((adapter) => {
+					return Promise.resolve()
+						.then(() => {
+							if (Array.isArray(params.entities)) {
+								return this.validateEntity(params.entities)
+									.then(entities => adapter.insertMany(entities));
+							} else if (params.entity) {
+								return this.validateEntity(params.entity)
+									.then(entity => adapter.insert(entity));
+							}
+							return Promise.reject(new MoleculerClientError("Invalid request! The 'params' must contain 'entity' or 'entities'!", 400));
+						})
+						.then(docs => this.transformDocuments(ctx, params, docs))
+						.then(json => this.entityChanged("created", json, ctx).then(() => json));
+				});
 			}
 		},
 
@@ -332,14 +350,16 @@ module.exports = {
 						sets[prop] = ctx.params[prop];
 				});
 
-				return this.adapter.updateById(id, { "$set": sets })
-					.then(doc => {
-						if (!doc)
-							return Promise.reject(new EntityNotFoundError(id));
+				return this.getAdapter(ctx).then((adapter) => {
+					return adapter.updateById(id, { "$set": sets })
+						.then(doc => {
+							if (!doc)
+								return Promise.reject(new EntityNotFoundError(id));
 
-						return this.transformDocuments(ctx, ctx.params, doc)
-							.then(json => this.entityChanged("updated", json, ctx).then(() => json));
-					});
+							return this.transformDocuments(ctx, ctx.params, doc)
+								.then(json => this.entityChanged("updated", json, ctx).then(() => json));
+						});
+				});
 
 			}
 		},
@@ -362,15 +382,16 @@ module.exports = {
 				let params = this.sanitizeParams(ctx, ctx.params);
 				const id = this.decodeID(params.id);
 
-				return this.adapter.removeById(id)
-					.then(doc => {
-						if (!doc)
-							return Promise.reject(new EntityNotFoundError(params.id));
+				return this.getAdapter(ctx).then((adapter) => {
+					return adapter.removeById(id)
+						.then(doc => {
+							if (!doc)
+								return Promise.reject(new EntityNotFoundError(params.id));
 
-						return this.transformDocuments(ctx, params, doc)
-							.then(json => this.entityChanged("removed", json, ctx).then(() => json));
-					});
-
+							return this.transformDocuments(ctx, params, doc)
+								.then(json => this.entityChanged("removed", json, ctx).then(() => json));
+						});
+				});
 			}
 		}
 	},
@@ -379,30 +400,78 @@ module.exports = {
 	 * Methods
 	 */
 	methods: {
+		/**
+		 * get adapter based on ctx, if not ctx given it will use the default adapter
+		 * if ctx and tenant stratergy are present it will call getAdapter and getAdapterHash
+		 * @param {*} [ctx]
+		 */
+		getAdapter(ctx) {
+			const useTenantStrategy = this.tenantStrategy && ctx;
+			const hash = useTenantStrategy ? this.tenantStrategy.getAdapterHash(ctx) : "default";
+
+			if (this.adapters[hash]) {
+				return Promise.resolve(this.adapters[hash]);
+			}
+
+			this.adapters[hash] = useTenantStrategy ? this.tenantStrategy.getAdapter(ctx) : this.adapter;
+			this.adapters[hash].init(this.broker, this);
+
+			// if default no need to connect because connect will be called on started method
+			if (hash === "default") {
+				return this.adapters[hash];
+			}
+
+			return this.connect({ hash: hash, adapter: this.adapters[hash] }).then(() => this.adapters[hash]);
+		},
 
 		/**
 		 * Connect to database.
+		 * @param {object} [adapterWithHash]
+		 * @param {string} [adapterWithHash.hash]
+		 * @param {object} [adapterWithHash.adapter]
 		 */
-		connect() {
-			return this.adapter.connect().then(() => {
-				// Call an 'afterConnected' handler in schema
-				if (_.isFunction(this.schema.afterConnected)) {
-					try {
-						return this.schema.afterConnected.call(this);
-					} catch(err) {
-						/* istanbul ignore next */
-						this.logger.error("afterConnected error!", err);
-					}
-				}
-			});
+		connect(adapterWithHash) {
+			const adapters = adapterWithHash ? { [adapterWithHash.hash]: adapterWithHash.adapter } : this.adapters;
+			return Promise.all(Object.keys(adapters).map((adapterHash) => {
+				return new Promise((resolve) => {
+					const connecting = (adapter, hash) => {
+						return adapter.connect().then(resolve).then(() => {
+							// Call an 'afterConnected' handler in schema
+							if (_.isFunction(this.schema.afterConnected)) {
+								try {
+									return this.schema.afterConnected.call(this);
+								} catch (err) {
+									/* istanbul ignore next */
+									this.logger.error("adapter hash:", hash);
+									this.logger.error("afterConnected error!", err);
+								}
+							}
+						}).catch((err) => {
+							setTimeout(() => {
+								this.logger.error("adapter hash:", hash);
+								this.logger.error("Connection error!", err);
+								this.logger.warn("Reconnecting...");
+								connecting(adapter, hash);
+							}, 1000);
+						});
+					};
+
+					connecting(adapters[adapterHash], adapterHash);
+				});
+			}));
 		},
 
 		/**
 		 * Disconnect from database.
 		 */
 		disconnect() {
-			if (_.isFunction(this.adapter.disconnect))
-				return this.adapter.disconnect();
+			const adapters = _.values(this.adapters);
+			// clear adapters cache
+			this.adapters = {};
+			return Promise.all(adapters.map((_adapter) => {
+				if (_.isFunction(_adapter.disconnect))
+					return _adapter.disconnect();
+			}));
 		},
 
 		/**
@@ -416,22 +485,22 @@ module.exports = {
 			let p = Object.assign({}, params);
 
 			// Convert from string to number
-			if (typeof(p.limit) === "string")
+			if (typeof (p.limit) === "string")
 				p.limit = Number(p.limit);
-			if (typeof(p.offset) === "string")
+			if (typeof (p.offset) === "string")
 				p.offset = Number(p.offset);
-			if (typeof(p.page) === "string")
+			if (typeof (p.page) === "string")
 				p.page = Number(p.page);
-			if (typeof(p.pageSize) === "string")
+			if (typeof (p.pageSize) === "string")
 				p.pageSize = Number(p.pageSize);
 
-			if (typeof(p.sort) === "string")
+			if (typeof (p.sort) === "string")
 				p.sort = p.sort.replace(/,/, " ").split(" ");
 
-			if (typeof(p.fields) === "string")
+			if (typeof (p.fields) === "string")
 				p.fields = p.fields.replace(/,/, " ").split(" ");
 
-			if (typeof(p.populate) === "string")
+			if (typeof (p.populate) === "string")
 				p.populate = p.populate.replace(/,/, " ").split(" ");
 
 			if (ctx.action.name.endsWith(".list")) {
@@ -464,21 +533,21 @@ module.exports = {
 		 * @methods
 		 * @param {String|Number|Array} id - ID or IDs.
 		 * @param {Boolean} decoding - Need to decode IDs.
+		 * @param {Context} [ctx]
 		 * @returns {Object|Array<Object>} Found entity(ies).
 		 */
-		getById(id, decoding) {
-			return Promise.resolve()
-				.then(() => {
-					if (_.isArray(id)) {
-						if (decoding)
-							id = id.map(id => this.decodeID(id));
-						return this.adapter.findByIds(id);
-					} else {
-						if (decoding)
-							id = this.decodeID(id);
-						return this.adapter.findById(id);
-					}
-				});
+		getById(id, decoding, ctx) {
+			return this.getAdapter(ctx).then((adapter) => {
+				if (_.isArray(id)) {
+					if (decoding)
+						id = id.map(id => this.decodeID(id));
+					return adapter.findByIds(id);
+				} else {
+					if (decoding)
+						id = this.decodeID(id);
+					return adapter.findById(id);
+				}
+			});
 		},
 
 		/**
@@ -529,39 +598,39 @@ module.exports = {
 					return Promise.resolve(docs);
 			}
 
-			return Promise.resolve(docs)
+			return this.getAdapter(ctx).then((adapter) => {
+				return Promise.resolve(docs)
+					// Convert entity to JS object
+					.then(docs => docs.map(doc => adapter.entityToObject(doc)))
 
-				// Convert entity to JS object
-				.then(docs => docs.map(doc => this.adapter.entityToObject(doc)))
+					// Encode IDs
+					.then(docs => docs.map(doc => {
+						doc[this.settings.idField] = this.encodeID(doc[this.settings.idField]);
+						return doc;
+					}))
 
-				// Encode IDs
-				.then(docs => docs.map(doc => {
-					doc[this.settings.idField] = this.encodeID(doc[this.settings.idField]);
-					return doc;
-				}))
+					// Populate
+					.then(json => (ctx && params.populate) ? this.populateDocs(ctx, json, params.populate) : json)
+					// TODO onTransformHook
 
-				// Populate
-				.then(json => (ctx && params.populate) ? this.populateDocs(ctx, json, params.populate) : json)
+					// Filter fields
+					.then(json => {
+						let fields = ctx && params.fields ? params.fields : this.settings.fields;
 
-				// TODO onTransformHook
+						// Compatibility with < 0.4
+						/* istanbul ignore next */
+						if (_.isString(fields))
+							fields = fields.split(" ");
 
-				// Filter fields
-				.then(json => {
-					let fields = ctx && params.fields ? params.fields : this.settings.fields;
+						// Authorize the requested fields
+						const authFields = this.authorizeFields(fields);
 
-					// Compatibility with < 0.4
-					/* istanbul ignore next */
-					if (_.isString(fields))
-						fields = fields.split(" ");
+						return json.map(item => this.filterFields(item, authFields));
+					})
 
-					// Authorize the requested fields
-					const authFields = this.authorizeFields(fields);
-
-					return json.map(item => this.filterFields(item, authFields));
-				})
-
-				// Return
-				.then(json => isDoc ? json[0] : json);
+					// Return
+					.then(json => isDoc ? json[0] : json);
+			});
 		},
 
 		/**
@@ -742,12 +811,17 @@ module.exports = {
 			this.settings.fields = this.settings.fields.split(" ");
 		}
 
-		if (!this.schema.adapter)
+		this.adapters = {};
+		this.adapter = this.schema.adapter;
+		this.tenantStrategy = this.schema.tenantStrategy;
+		if (!this.adapter && !this.tenantStrategy) {
 			this.adapter = new MemoryAdapter();
-		else
-			this.adapter = this.schema.adapter;
+		}
 
-		this.adapter.init(this.broker, this);
+		if (this.adapter) {
+			// this will init the default adapter
+			this.getAdapter();
+		}
 
 		// Transform entity validation schema to checker function
 		if (this.broker.validator && _.isObject(this.settings.entityValidator)) {
@@ -767,32 +841,15 @@ module.exports = {
 	 * Service started lifecycle event handler
 	 */
 	started() {
-		if (this.adapter) {
-			return new Promise(resolve => {
-				let connecting = () => {
-					this.connect().then(resolve).catch(err => {
-						setTimeout(() => {
-							this.logger.error("Connection error!", err);
-							this.logger.warn("Reconnecting...");
-							connecting();
-						}, 1000);
-					});
-				};
-
-				connecting();
-			});
-		}
-
-		/* istanbul ignore next */
-		return Promise.reject(new Error("Please set the store adapter in schema!"));
+		// connect error retry happens lazily
+		return this.connect();
 	},
 
 	/**
 	 * Service stopped lifecycle event handler
 	 */
 	stopped() {
-		if (this.adapter)
-			return this.disconnect();
+		return this.disconnect();
 	},
 
 	// Export Memory Adapter class
